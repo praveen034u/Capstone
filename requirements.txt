@@ -5,6 +5,5 @@ googletrans==4.0.0-rc1
 pypdf==4.3.1           # if you read PDFs
 pandas==2.2.2          # if you handle CSV/XLSX
 openpyxl==3.1.5        # for XLSX
-genai
 google-generativeai
 pydub
