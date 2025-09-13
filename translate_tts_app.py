@@ -1,63 +1,90 @@
 import os
+import io
+import wave
 import tempfile
 from io import BytesIO
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 import streamlit as st
 import pandas as pd
 from gtts import gTTS
 import PyPDF2
-
-# Gemini (google-generativeai)
 import google.generativeai as genai
 
-# Whisper (OpenAI)
-from openai import OpenAI
+# Google Cloud Speech-to-Text
+from google.cloud import speech_v1p1beta1 as speech
+from google.oauth2 import service_account
 
-# In-browser mic capture
+# In-browser microphone
 from streamlit_mic_recorder import mic_recorder
 
 
 # =========================
-# App & Secrets Setup
+# Page & Secrets
 # =========================
-st.set_page_config(page_title="Translate + TTS", layout="centered")
-st.title("🎙️ Translate & Speak App")
-st.caption("Microphone → Whisper (STT) → Gemini (Translate) → gTTS (Audio)")
+st.set_page_config(page_title="Translate + TTS (Powered By Gemini AI)", layout="centered")
+st.title("🎙️ Translate & Speak App (Powered By Gemini AI)")
+st.caption("Microphone → Google STT → Gemini (Translate) → gTTS (Audio)")
 
-# Secrets: prefer Streamlit secrets, fallback to environment
-GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY") or os.environ.get("GEMINI_API_KEY", "")
-OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY", "")
+# Prefer Streamlit Secrets, fallback to environment
+GEMINI_API_KEY = (st.secrets.get("GEMINI_API_KEY") or os.environ.get("GEMINI_API_KEY") or "").strip()
+
+# Option A (recommended on Streamlit Cloud): service account pasted under a TOML table
+# [gcp_service_account] with quoted keys in secrets.toml
+GCP_SA_INFO = st.secrets.get("gcp_service_account", None)
 
 if not GEMINI_API_KEY:
     st.error("GEMINI_API_KEY is not set. Add it in Streamlit Secrets or as an environment variable.")
     st.stop()
 
 # Configure Gemini
-genai.configure(api_key=GEMINI_API_KEY)
+try:
+    genai.configure(api_key=GEMINI_API_KEY)
+except Exception as e:
+    st.error(f"Failed to configure Gemini: {e}")
+    st.stop()
 
-# Configure OpenAI (for Whisper STT). Mic mode will be disabled if not provided.
-client: Optional[OpenAI] = None
-if OPENAI_API_KEY:
-    client = OpenAI(api_key=OPENAI_API_KEY)
+# Configure Google Speech Client
+try:
+    if GCP_SA_INFO:
+        credentials = service_account.Credentials.from_service_account_info(GCP_SA_INFO)
+        speech_client = speech.SpeechClient(credentials=credentials)
+    else:
+        # Uses ADC if available (e.g., GOOGLE_APPLICATION_CREDENTIALS)
+        speech_client = speech.SpeechClient()
+except Exception as e:
+    st.error(f"Failed to create Google Speech client: {e}")
+    st.stop()
 
-# Use a current Gemini model that supports text generation
-GEMINI_MODEL = "gemini-2.0-flash"  # update later if Google changes defaults
+# Current Gemini model
+GEMINI_MODEL = "gemini-2.0-flash"
 
 
 # =========================
-# Language Map
+# Language Maps
 # =========================
-LANGUAGES = {
+DISPLAY_LANGUAGES = {
     "English": "en",
     "Hindi": "hi",
     "Spanish": "es",
     "French": "fr",
     "German": "de",
     "Chinese (Simplified)": "zh-cn",
-    "Japanese": "ja"
+    "Japanese": "ja",
 }
+
+# For Speech-to-Text detection, we provide a primary language and alternatives
+PRIMARY_SPEECH_LANG = "en-US"
+ALT_SPEECH_LANGS: List[str] = [
+    "hi-IN",        # Hindi
+    "es-ES",        # Spanish (Spain)
+    "es-MX",        # Spanish (Mexico)
+    "fr-FR",        # French
+    "de-DE",        # German
+    "cmn-Hans-CN",  # Chinese Mandarin (Simplified)
+    "ja-JP",        # Japanese
+]
 
 
 # =========================
@@ -128,31 +155,107 @@ def text_to_speech(text: str, lang_code: str) -> Optional[BytesIO]:
         return None
 
 
-def transcribe_audio_bytes(audio_bytes: bytes, filename_hint: str = "speech.wav") -> Optional[str]:
-    """
-    Save audio bytes to a temp file and transcribe with OpenAI Whisper (whisper-1).
-    Auto-detects spoken language. Returns transcript or None.
+# --- Audio sniffers ---
+def _is_wav(bytes_: bytes) -> bool:
+    # Basic RIFF/WAVE header check: 'RIFF'....'WAVE'
+    return len(bytes_) >= 12 and bytes_[:4] == b"RIFF" and bytes_[8:12] == b"WAVE"
 
-    Requires OPENAI_API_KEY and network access.
+def _is_ogg(bytes_: bytes) -> bool:
+    # OGG magic: "OggS"
+    return len(bytes_) >= 4 and bytes_[:4] == b"OggS"
+
+def _is_webm(bytes_: bytes) -> bool:
+    # WebM/Matroska typically starts with EBML magic: 0x1A 45 DF A3
+    return len(bytes_) >= 4 and bytes_[:4] == b"\x1A\x45\xDF\xA3"
+
+def _wav_samplerate_from_bytes(wav_bytes: bytes) -> Optional[int]:
     """
-    if client is None:
-        st.error("OPENAI_API_KEY is not set. Microphone transcription requires OpenAI Whisper.")
+    Extract WAV samplerate from header, if possible.
+    """
+    try:
+        with wave.open(io.BytesIO(wav_bytes), "rb") as w:
+            return w.getframerate()
+    except Exception:
         return None
 
-    try:
-        suffix = Path(filename_hint).suffix or ".wav"
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(audio_bytes)
-            tmp_path = tmp.name
 
-        with open(tmp_path, "rb") as f:
-            tr = client.audio.transcriptions.create(
-                model="whisper-1",
-                file=f
-            )
-        return tr.text.strip() if tr and getattr(tr, "text", None) else None
+def transcribe_with_google_stt(
+    audio_bytes: bytes,
+    sample_rate_hz: Optional[int] = None,
+    primary_lang: str = PRIMARY_SPEECH_LANG,
+    alt_langs: Optional[List[str]] = None,
+    debug: bool = False,
+) -> Optional[str]:
+    """
+    Try multiple configs so we still get text even if the bytes aren't LINEAR16 WAV.
+    Order:
+      1) If WAV -> LINEAR16 (with inferred or provided sample_rate)
+      2) OGG_OPUS
+      3) WEBM_OPUS
+      4) ENCODING_UNSPECIFIED (let Google infer from container/headers)
+    Returns transcript string or None.
+    """
+    def _config(encoding, sr=None):
+        kw = dict(
+            encoding=encoding,
+            language_code=primary_lang,
+            enable_automatic_punctuation=True,
+            audio_channel_count=1,
+        )
+        if sr:
+            kw["sample_rate_hertz"] = sr
+        if alt_langs:
+            kw["alternative_language_codes"] = alt_langs
+        return speech.RecognitionConfig(**kw)
+
+    def _recognize(cfg) -> Optional[str]:
+        try:
+            audio = speech.RecognitionAudio(content=audio_bytes)
+            resp = speech_client.recognize(config=cfg, audio=audio)
+            if debug:
+                st.write({"stt_encoding": cfg.encoding.name, "response_results": len(resp.results)})
+            texts = []
+            for r in resp.results:
+                if r.alternatives:
+                    texts.append(r.alternatives[0].transcript)
+            text = " ".join(texts).strip()
+            return text or None
+        except Exception as e:
+            if debug:
+                st.warning(f"Google STT error with {cfg.encoding.name}: {e}")
+            return None
+
+    # Build attempts
+    attempts = []
+    if _is_wav(audio_bytes):
+        sr = sample_rate_hz or _wav_samplerate_from_bytes(audio_bytes)
+        attempts.append(_config(speech.RecognitionConfig.AudioEncoding.LINEAR16, sr))
+    if _is_ogg(audio_bytes):
+        attempts.append(_config(speech.RecognitionConfig.AudioEncoding.OGG_OPUS, sample_rate_hz))
+    if _is_webm(audio_bytes):
+        attempts.append(_config(speech.RecognitionConfig.AudioEncoding.WEBM_OPUS, sample_rate_hz))
+    # Always include an inference fallback
+    attempts.append(_config(speech.RecognitionConfig.AudioEncoding.ENCODING_UNSPECIFIED, sample_rate_hz))
+
+    for cfg in attempts:
+        out = _recognize(cfg)
+        if out:
+            return out
+    return None
+
+
+# --- Mic stability helpers ---
+def _safe_mic_recorder(**kwargs):
+    """
+    Wrap mic_recorder to survive cases where component returns a dict missing keys
+    (e.g., 'sample_rate') and raises KeyError internally. Return None instead of crashing.
+    """
+    try:
+        return mic_recorder(**kwargs)
+    except KeyError:
+        return None
     except Exception as e:
-        st.error(f"STT failed: {e}")
+        st.warning(f"Mic component error: {type(e).__name__}")
         return None
 
 
@@ -168,17 +271,17 @@ if "input_text_cache" not in st.session_state:
 # =========================
 # Input Mode
 # =========================
-modes = ["Type Text", "Upload File"]
-if client is not None:
-    modes.append("Use Microphone")  # only show if OPENAI_API_KEY configured
-
-input_mode = st.radio("Input Type:", modes, horizontal=True)
+input_mode = st.radio("Input Type:", ["Type Text", "Upload File", "Use Microphone"], horizontal=True)
 input_text = ""
 
 
 # 1) Type
 if input_mode == "Type Text":
-    input_text = st.text_area("✍️ Enter your text here:", height=150, value=st.session_state.get("input_text_cache", ""))
+    input_text = st.text_area(
+        "✍️ Enter your text here:",
+        height=150,
+        value=st.session_state.get("input_text_cache", "")
+    )
 
 # 2) Upload
 elif input_mode == "Upload File":
@@ -189,46 +292,66 @@ elif input_mode == "Upload File":
             st.success("✅ File content loaded.")
             st.text_area("📄 Extracted Text", input_text, height=150)
 
-# 3) Microphone (only if OPENAI_API_KEY present)
+# 3) Microphone (Google STT)
 elif input_mode == "Use Microphone":
     st.markdown("🎤 Click **Start recording** to speak, then click **Stop recording**.")
-    audio_dict = mic_recorder(
+    debug_stt = st.toggle("Debug STT", value=False, help="Show raw STT responses and configs")
+
+    audio_dict = _safe_mic_recorder(
         start_prompt="Start recording",
         stop_prompt="Stop recording",
         just_once=False,
         use_container_width=True
     )
 
+    # audio_dict: may contain 'bytes' and sometimes 'sample_rate'. Be defensive.
     if audio_dict and isinstance(audio_dict, dict) and audio_dict.get("bytes"):
-        transcript = transcribe_audio_bytes(audio_dict["bytes"], filename_hint="speech.wav")
+        sr = audio_dict.get("sample_rate") or _wav_samplerate_from_bytes(audio_dict["bytes"])
+
+        transcript = transcribe_with_google_stt(
+            audio_bytes=audio_dict["bytes"],
+            sample_rate_hz=sr,                 # okay if None
+            primary_lang=PRIMARY_SPEECH_LANG,  # bias to en-US
+            alt_langs=ALT_SPEECH_LANGS,        # auto-detect among these
+            debug=debug_stt,
+        )
         if transcript:
             input_text = transcript
             st.success("📝 Transcribed text:")
             st.write(input_text)
         else:
-            st.warning("Could not transcribe. Please try again.")
+            st.warning("Could not transcribe. Please try again. (Try speaking a bit longer and clearly.)")
 
     st.divider()
-    st.caption("If your browser blocks microphone access, allow mic permission or use the upload option below.")
-    fallback = st.file_uploader("Or upload an audio file (MP3/WebM/WAV/M4A)", type=["mp3", "webm", "wav", "m4a"])
+    st.caption("If your browser blocks mic access, allow permission or use the upload option.")
+    fallback = st.file_uploader("Or upload a short audio clip (WAV/OGG/WebM)", type=["wav", "ogg", "webm"])
     if fallback:
-        transcript = transcribe_audio_bytes(fallback.read(), filename_hint=fallback.name)
+        data = fallback.read()
+        sr_up = _wav_samplerate_from_bytes(data) if _is_wav(data) else None
+
+        transcript = transcribe_with_google_stt(
+            audio_bytes=data,
+            sample_rate_hz=sr_up,
+            primary_lang=PRIMARY_SPEECH_LANG,
+            alt_langs=ALT_SPEECH_LANGS,
+            debug=debug_stt,
+        )
         if transcript:
             input_text = transcript
             st.success("📝 Transcribed text (from file):")
             st.write(input_text)
 
 
-# Cache what user typed or captured so it persists for TTS later
+# Persist current input text for later TTS
 if input_text:
     st.session_state.input_text_cache = input_text
 
 
 # =========================
-# Language Selection
+# Target Language Selection
 # =========================
-target_language = st.selectbox("🌐 Target Language:", list(LANGUAGES.keys()))
-lang_code = LANGUAGES[target_language]
+target_language = st.selectbox("🌐 Target Language:", list(DISPLAY_LANGUAGES.keys()))
+lang_code = DISPLAY_LANGUAGES[target_language]
 
 
 # =========================
@@ -278,11 +401,21 @@ if st.button("🔊 Generate Audio"):
 # =========================
 with st.expander("ℹ️ Instructions"):
     st.markdown("""
-    **How it works**
-    1. Choose your input method (type, upload, or microphone — mic requires OPENAI Whisper).
-    2. Translate your text using **Gemini**.
-    3. Generate audio with **gTTS** and download the MP3.
+    **How it works (Google-only)**
+    1. Choose input (Type / Upload / Microphone).
+    2. Microphone uses **Google Cloud Speech-to-Text** with auto language detection among common languages.
+    3. Translation uses **Gemini**.
+    4. Audio is generated with **gTTS** (downloadable MP3).
+
+    **Notes**
+    - Mic records **WAV/PCM** in most browsers; we also try OGG/WebM variants.
+    - If you paste a Google service account into `.streamlit/secrets.toml`, ensure keys are **quoted**:
+      ```
+      [gcp_service_account]
+      "type" = "service_account"
+      ...
+      ```
     """)
 
 st.markdown("---")
-st.caption("Made with ❤️ using Streamlit + Gemini + Whisper + gTTS")
+st.caption("Made with ❤️ using Streamlit + Google Cloud STT + Gemini + gTTS")
